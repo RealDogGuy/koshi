@@ -1,5 +1,7 @@
 using UnityEngine;
 
+public enum BalanceState { Standing, Stumbling, Ragdoll, GettingUp }
+
 public class ProceduralLegs2D : MonoBehaviour
 {
     [Header("Body References")]
@@ -8,6 +10,8 @@ public class ProceduralLegs2D : MonoBehaviour
     public Rigidbody2D rightFoot;
     [Tooltip("Torso segments for upright torque (Hip, MiddleTorso, UpperTorso, Head).")]
     public Rigidbody2D[] uprightBodies;
+    [Tooltip("All rigidbodies in the physics rig (for impact sensors + ragdoll state).")]
+    public Rigidbody2D[] allBodies;
 
     [Header("Ground")]
     public LayerMask groundLayer;
@@ -21,14 +25,12 @@ public class ProceduralLegs2D : MonoBehaviour
     public float hipFrequency = 5f;
     public float hipDampingRatio = 0.8f;
     public float hipMaxForce = 600f;
-    [Tooltip("Vertical bob amplitude during a step.")]
     public float hipBobAmount = 0.05f;
 
     [Header("Foot Spring")]
     public float footFrequency = 8f;
     public float footDampingRatio = 0.8f;
     public float footMaxForce = 500f;
-    [Tooltip("Extra force multiplier on planted foot during a step.")]
     public float plantForceMult = 1.6f;
 
     [Header("Upright Balance")]
@@ -45,10 +47,26 @@ public class ProceduralLegs2D : MonoBehaviour
     public float stepCooldown = 0.08f;
 
     [Header("Movement")]
-    [Tooltip("Set from your input script. Negative = left, positive = right.")]
     public float moveInput;
     public float moveForce = 30f;
 
+    [Header("Impact Response")]
+    [Tooltip("Impact velocity to trigger a stumble.")]
+    public float stumbleThreshold = 3f;
+    [Tooltip("Impact velocity to trigger full ragdoll.")]
+    public float knockdownThreshold = 8f;
+    public float stumbleDuration = 0.6f;
+    [Tooltip("Strength multiplier during stumble (0-1).")]
+    [Range(0f, 1f)]
+    public float stumbleStrengthMult = 0.35f;
+    [Tooltip("Seconds to wait on the ground before getting up.")]
+    public float getUpDelay = 1f;
+    [Tooltip("Seconds to transition from ragdoll to standing.")]
+    public float getUpDuration = 0.8f;
+    [Tooltip("Body must be below this speed to start getting up.")]
+    public float settleSpeed = 1f;
+
+    // Runtime state
     TargetJoint2D _hipJoint;
     TargetJoint2D _leftFootJoint;
     TargetJoint2D _rightFootJoint;
@@ -61,7 +79,14 @@ public class ProceduralLegs2D : MonoBehaviour
     Vector2 _stepTarget;
     Vector2 _leftPlantPos;
     Vector2 _rightPlantPos;
-    float _groundY;
+    float _leftGroundY;
+    float _rightGroundY;
+
+    BalanceState _state = BalanceState.Standing;
+    float _stateTimer;
+    float _strengthScale = 1f;
+
+    public BalanceState CurrentState => _state;
 
     void Start()
     {
@@ -71,7 +96,10 @@ public class ProceduralLegs2D : MonoBehaviour
 
         _leftPlantPos = leftFoot.position;
         _rightPlantPos = rightFoot.position;
-        _groundY = Mathf.Min(_leftPlantPos.y, _rightPlantPos.y);
+        _leftGroundY = _leftPlantPos.y;
+        _rightGroundY = _rightPlantPos.y;
+
+        AttachImpactSensors();
     }
 
     TargetJoint2D AddJoint(Rigidbody2D body, float freq, float damp, float maxF)
@@ -84,23 +112,172 @@ public class ProceduralLegs2D : MonoBehaviour
         return tj;
     }
 
-    void UpdateGroundY()
+    void AttachImpactSensors()
     {
-        RaycastHit2D hit = Physics2D.Raycast(hipBody.position, Vector2.down, groundRayLength, groundLayer);
-        if (hit.collider != null)
-            _groundY = hit.point.y;
+        if (allBodies == null) return;
+        foreach (Rigidbody2D rb in allBodies)
+        {
+            if (rb == null) continue;
+            var sensor = rb.gameObject.AddComponent<ImpactSensor2D>();
+            sensor.owner = this;
+            sensor.ignoreLayer = groundLayer;
+        }
     }
+
+    // --- Impact callback from ImpactSensor2D ---
+
+    public void OnImpact(float force, Vector2 relativeVelocity, Vector2 point)
+    {
+        if (_state == BalanceState.Ragdoll || _state == BalanceState.GettingUp) return;
+
+        if (force >= knockdownThreshold)
+            EnterState(BalanceState.Ragdoll);
+        else if (force >= stumbleThreshold && _state != BalanceState.Stumbling)
+            EnterState(BalanceState.Stumbling);
+    }
+
+    void EnterState(BalanceState newState)
+    {
+        _state = newState;
+        _stateTimer = 0f;
+
+        switch (newState)
+        {
+            case BalanceState.Standing:
+                _strengthScale = 1f;
+                break;
+
+            case BalanceState.Stumbling:
+                _strengthScale = stumbleStrengthMult;
+                _isStepping = false;
+                break;
+
+            case BalanceState.Ragdoll:
+                _strengthScale = 0f;
+                _isStepping = false;
+                break;
+
+            case BalanceState.GettingUp:
+                _strengthScale = 0f;
+                _leftPlantPos = leftFoot.position;
+                _rightPlantPos = rightFoot.position;
+                break;
+        }
+    }
+
+    // --- Ground detection per foot ---
+
+    float RaycastGroundY(float x)
+    {
+        Vector2 origin = new Vector2(x, hipBody.position.y);
+        RaycastHit2D hit = Physics2D.Raycast(origin, Vector2.down, groundRayLength, groundLayer);
+        if (hit.collider != null)
+            return hit.point.y;
+        return (_leftPlantPos.y + _rightPlantPos.y) * 0.5f;
+    }
+
+    void UpdateGroundAtFeet()
+    {
+        _leftGroundY = RaycastGroundY(_leftPlantPos.x);
+        _rightGroundY = RaycastGroundY(_rightPlantPos.x);
+    }
+
+    float GroundYAtX(float x)
+    {
+        return RaycastGroundY(x);
+    }
+
+    // --- Main update ---
 
     void FixedUpdate()
     {
-        UpdateGroundY();
-        ApplyUprightTorque();
+        _stateTimer += Time.fixedDeltaTime;
+        UpdateGroundAtFeet();
 
-        float hipX = hipBody.position.x;
+        switch (_state)
+        {
+            case BalanceState.Standing:
+                UpdateStanding();
+                break;
+            case BalanceState.Stumbling:
+                UpdateStumbling();
+                break;
+            case BalanceState.Ragdoll:
+                UpdateRagdoll();
+                break;
+            case BalanceState.GettingUp:
+                UpdateGettingUp();
+                break;
+        }
+    }
+
+    void UpdateStanding()
+    {
+        _strengthScale = 1f;
+        ApplyUprightTorque(_strengthScale);
+        ApplyHip(_strengthScale);
+        ApplyMovement();
+        UpdateFeet(_strengthScale);
+    }
+
+    void UpdateStumbling()
+    {
+        ApplyUprightTorque(_strengthScale);
+        ApplyHip(_strengthScale);
+        UpdateFeet(_strengthScale);
+
+        if (_stateTimer >= stumbleDuration)
+            EnterState(BalanceState.Standing);
+    }
+
+    void UpdateRagdoll()
+    {
+        ZeroAllForces();
+
+        if (_stateTimer >= getUpDelay && hipBody.linearVelocity.magnitude < settleSpeed)
+            EnterState(BalanceState.GettingUp);
+    }
+
+    void UpdateGettingUp()
+    {
+        float t = Mathf.Clamp01(_stateTimer / getUpDuration);
+        _strengthScale = t * t;
+
+        _leftPlantPos = leftFoot.position;
+        _rightPlantPos = rightFoot.position;
+
+        ApplyUprightTorque(_strengthScale);
+        ApplyHip(_strengthScale);
+        SetFoot(_leftFootJoint, _leftPlantPos, false, _strengthScale);
+        SetFoot(_rightFootJoint, _rightPlantPos, false, _strengthScale);
+
+        if (t >= 1f)
+            EnterState(BalanceState.Standing);
+    }
+
+    // --- Subsystems ---
+
+    void ApplyUprightTorque(float scale)
+    {
+        if (uprightBodies == null || uprightBodies.Length == 0) return;
+
+        float share = 1f / uprightBodies.Length;
+        for (int i = 0; i < uprightBodies.Length; i++)
+        {
+            Rigidbody2D body = uprightBodies[i];
+            if (body == null) continue;
+
+            float err = Mathf.DeltaAngle(body.rotation, targetAngle);
+            float torque = (err * uprightForce - body.angularVelocity * uprightDamping) * share * scale;
+            body.AddTorque(Mathf.Clamp(torque, -maxUprightTorque * scale, maxUprightTorque * scale));
+        }
+    }
+
+    void ApplyHip(float scale)
+    {
         float footMidX = (_leftPlantPos.x + _rightPlantPos.x) * 0.5f;
-        bool hasInput = Mathf.Abs(moveInput) > 0.1f;
+        float avgGroundY = (_leftGroundY + _rightGroundY) * 0.5f;
 
-        // --- Hip: standing height + bob ---
         float bobOffset = 0f;
         if (_isStepping)
         {
@@ -108,54 +285,62 @@ public class ProceduralLegs2D : MonoBehaviour
             bobOffset = -hipBobAmount * Mathf.Sin(t * Mathf.PI);
         }
 
-        _hipJoint.target = new Vector2(footMidX, _groundY + standHeight + bobOffset);
+        _hipJoint.target = new Vector2(footMidX, avgGroundY + standHeight + bobOffset);
         _hipJoint.frequency = hipFrequency;
         _hipJoint.dampingRatio = hipDampingRatio;
-        _hipJoint.maxForce = hipMaxForce;
+        _hipJoint.maxForce = hipMaxForce * scale;
+    }
 
-        // --- Movement force ---
-        if (hasInput)
+    void ApplyMovement()
+    {
+        if (Mathf.Abs(moveInput) > 0.1f)
             hipBody.AddForce(Vector2.right * moveInput * moveForce);
+    }
 
-        // --- Cooldown ---
+    void UpdateFeet(float scale)
+    {
+        float hipX = hipBody.position.x;
+        float footMidX = (_leftPlantPos.x + _rightPlantPos.x) * 0.5f;
+        bool hasInput = Mathf.Abs(moveInput) > 0.1f;
+
         if (_cooldownTimer > 0f)
             _cooldownTimer -= Time.fixedDeltaTime;
 
-        // --- Feet ---
         if (!_isStepping)
         {
-            SetFoot(_leftFootJoint, _leftPlantPos, false);
-            SetFoot(_rightFootJoint, _rightPlantPos, false);
+            SetFoot(_leftFootJoint, _leftPlantPos, false, scale);
+            SetFoot(_rightFootJoint, _rightPlantPos, false, scale);
 
             if (_cooldownTimer <= 0f)
             {
                 float drift = hipX - footMidX;
-                bool balanceStep = Mathf.Abs(drift) > stepThreshold;
+                float threshold = _state == BalanceState.Stumbling
+                    ? stepThreshold * 0.5f
+                    : stepThreshold;
 
-                if (balanceStep || hasInput)
+                if (Mathf.Abs(drift) > threshold || (hasInput && _state == BalanceState.Standing))
                     BeginStep(hipX, drift, hasInput);
             }
         }
         else
         {
-            // Planted foot — extra stiff
             bool stepLeft = !_lastStepWasLeft;
             TargetJoint2D plantedJoint = stepLeft ? _rightFootJoint : _leftFootJoint;
             Vector2 plantPos = stepLeft ? _rightPlantPos : _leftPlantPos;
-            SetFoot(plantedJoint, plantPos, true);
+            SetFoot(plantedJoint, plantPos, true, scale);
 
-            // Swinging foot
             TargetJoint2D swingJoint = stepLeft ? _leftFootJoint : _rightFootJoint;
-            UpdateStep(swingJoint);
+            UpdateStep(swingJoint, scale);
         }
     }
 
-    void SetFoot(TargetJoint2D joint, Vector2 target, bool boosted)
+    void SetFoot(TargetJoint2D joint, Vector2 target, bool boosted, float scale)
     {
         joint.target = target;
         joint.frequency = footFrequency;
         joint.dampingRatio = footDampingRatio;
-        joint.maxForce = boosted ? footMaxForce * plantForceMult : footMaxForce;
+        float force = boosted ? footMaxForce * plantForceMult : footMaxForce;
+        joint.maxForce = force * scale;
     }
 
     void BeginStep(float hipX, float drift, bool hasInput)
@@ -163,7 +348,6 @@ public class ProceduralLegs2D : MonoBehaviour
         _isStepping = true;
         _stepTimer = 0f;
 
-        // Strict alternation
         bool stepLeft = !_lastStepWasLeft;
 
         Rigidbody2D swingFoot = stepLeft ? leftFoot : rightFoot;
@@ -182,20 +366,19 @@ public class ProceduralLegs2D : MonoBehaviour
             targetX = hipX;
         }
 
-        // Offset so feet don't cross — left foot lands left of center, right lands right
         float sideOffset = stepLeft ? -stanceHalfWidth : stanceHalfWidth;
         targetX += sideOffset;
 
+        float targetGroundY = GroundYAtX(targetX);
         Vector2 plantRef = stepLeft ? _rightPlantPos : _leftPlantPos;
-        _stepTarget = new Vector2(targetX, plantRef.y);
+        float footHeight = plantRef.y - (stepLeft ? _rightGroundY : _leftGroundY);
+        _stepTarget = new Vector2(targetX, targetGroundY + footHeight);
     }
 
-    void UpdateStep(TargetJoint2D swingJoint)
+    void UpdateStep(TargetJoint2D swingJoint, float scale)
     {
         _stepTimer += Time.fixedDeltaTime;
         float raw = Mathf.Clamp01(_stepTimer / stepDuration);
-
-        // Smoothstep for natural ease-in-out
         float t = raw * raw * (3f - 2f * raw);
 
         Vector2 pos = Vector2.Lerp(_stepStart, _stepTarget, t);
@@ -204,7 +387,7 @@ public class ProceduralLegs2D : MonoBehaviour
         swingJoint.target = pos;
         swingJoint.frequency = footFrequency;
         swingJoint.dampingRatio = footDampingRatio;
-        swingJoint.maxForce = footMaxForce;
+        swingJoint.maxForce = footMaxForce * scale;
 
         if (raw >= 1f)
         {
@@ -218,14 +401,12 @@ public class ProceduralLegs2D : MonoBehaviour
             _lastStepWasLeft = stepLeft;
             _cooldownTimer = stepCooldown;
 
-            // Auto-chain: if still moving, begin next step immediately
             bool hasInput = Mathf.Abs(moveInput) > 0.1f;
-            if (hasInput)
+            if (hasInput && _state == BalanceState.Standing)
             {
                 float hipX = hipBody.position.x;
                 float footMidX = (_leftPlantPos.x + _rightPlantPos.x) * 0.5f;
-                float drift = hipX - footMidX;
-                BeginStep(hipX, drift, true);
+                BeginStep(hipX, hipX - footMidX, true);
             }
             else
             {
@@ -234,21 +415,26 @@ public class ProceduralLegs2D : MonoBehaviour
         }
     }
 
-    void ApplyUprightTorque()
+    void ZeroAllForces()
     {
-        if (uprightBodies == null || uprightBodies.Length == 0) return;
-
-        float share = 1f / uprightBodies.Length;
-        for (int i = 0; i < uprightBodies.Length; i++)
-        {
-            Rigidbody2D body = uprightBodies[i];
-            if (body == null) continue;
-
-            float err = Mathf.DeltaAngle(body.rotation, targetAngle);
-            float torque = (err * uprightForce - body.angularVelocity * uprightDamping) * share;
-            body.AddTorque(Mathf.Clamp(torque, -maxUprightTorque, maxUprightTorque));
-        }
+        _hipJoint.maxForce = 0f;
+        _leftFootJoint.maxForce = 0f;
+        _rightFootJoint.maxForce = 0f;
     }
+
+    // --- Public API ---
+
+    public void ForceRagdoll()
+    {
+        EnterState(BalanceState.Ragdoll);
+    }
+
+    public void ForceStumble()
+    {
+        EnterState(BalanceState.Stumbling);
+    }
+
+    // --- Cleanup ---
 
     void OnDestroy()
     {
@@ -256,6 +442,8 @@ public class ProceduralLegs2D : MonoBehaviour
         if (_leftFootJoint != null) Destroy(_leftFootJoint);
         if (_rightFootJoint != null) Destroy(_rightFootJoint);
     }
+
+    // --- Gizmos ---
 
     void OnDrawGizmos()
     {
@@ -272,9 +460,20 @@ public class ProceduralLegs2D : MonoBehaviour
             return;
         }
 
+        // State label color
+        switch (_state)
+        {
+            case BalanceState.Standing:  Gizmos.color = Color.green;   break;
+            case BalanceState.Stumbling: Gizmos.color = Color.yellow;  break;
+            case BalanceState.Ragdoll:   Gizmos.color = Color.red;     break;
+            case BalanceState.GettingUp: Gizmos.color = new Color(1f, 0.5f, 0f); break;
+        }
+        Gizmos.DrawWireSphere(hipPos, 0.15f);
+
         // Standing height target
+        float avgGroundY = (_leftGroundY + _rightGroundY) * 0.5f;
+        float standY = avgGroundY + standHeight;
         Gizmos.color = new Color(1f, 1f, 0f, 0.4f);
-        float standY = _groundY + standHeight;
         Gizmos.DrawLine(new Vector3(hipPos.x - 0.3f, standY), new Vector3(hipPos.x + 0.3f, standY));
 
         // Foot plant positions
@@ -282,16 +481,20 @@ public class ProceduralLegs2D : MonoBehaviour
         Gizmos.DrawWireSphere(_leftPlantPos, 0.06f);
         Gizmos.DrawWireSphere(_rightPlantPos, 0.06f);
 
-        // Stance width markers
+        // Per-foot ground level
+        Gizmos.color = new Color(0.5f, 0.3f, 0f, 0.5f);
+        Gizmos.DrawLine(new Vector3(_leftPlantPos.x - 0.1f, _leftGroundY), new Vector3(_leftPlantPos.x + 0.1f, _leftGroundY));
+        Gizmos.DrawLine(new Vector3(_rightPlantPos.x - 0.1f, _rightGroundY), new Vector3(_rightPlantPos.x + 0.1f, _rightGroundY));
+
+        // Midpoint + threshold
         float midX = (_leftPlantPos.x + _rightPlantPos.x) * 0.5f;
         float midY = (_leftPlantPos.y + _rightPlantPos.y) * 0.5f;
+        float threshold = _state == BalanceState.Stumbling ? stepThreshold * 0.5f : stepThreshold;
         Gizmos.color = Color.cyan;
         Gizmos.DrawLine(new Vector3(midX, midY - 0.2f), new Vector3(midX, midY + 0.2f));
-
-        // Threshold zone
         Gizmos.color = new Color(0f, 1f, 1f, 0.3f);
-        Gizmos.DrawLine(new Vector3(midX - stepThreshold, midY - 0.15f), new Vector3(midX - stepThreshold, midY + 0.15f));
-        Gizmos.DrawLine(new Vector3(midX + stepThreshold, midY - 0.15f), new Vector3(midX + stepThreshold, midY + 0.15f));
+        Gizmos.DrawLine(new Vector3(midX - threshold, midY - 0.15f), new Vector3(midX - threshold, midY + 0.15f));
+        Gizmos.DrawLine(new Vector3(midX + threshold, midY - 0.15f), new Vector3(midX + threshold, midY + 0.15f));
 
         // Hip drift
         Gizmos.color = Color.red;
@@ -302,8 +505,6 @@ public class ProceduralLegs2D : MonoBehaviour
         {
             Gizmos.color = Color.magenta;
             Gizmos.DrawWireSphere(_stepTarget, 0.1f);
-
-            // Draw the full arc preview
             Vector2 prev = _stepStart;
             for (int i = 1; i <= 10; i++)
             {
@@ -316,8 +517,9 @@ public class ProceduralLegs2D : MonoBehaviour
             }
         }
 
-        // Ground ray
+        // Ground rays from feet
         Gizmos.color = Color.gray;
-        Gizmos.DrawLine(hipPos, hipPos + Vector2.down * groundRayLength);
+        Gizmos.DrawLine(new Vector3(_leftPlantPos.x, hipPos.y), new Vector3(_leftPlantPos.x, hipPos.y - groundRayLength));
+        Gizmos.DrawLine(new Vector3(_rightPlantPos.x, hipPos.y), new Vector3(_rightPlantPos.x, hipPos.y - groundRayLength));
     }
 }
