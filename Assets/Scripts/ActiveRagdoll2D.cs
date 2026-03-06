@@ -36,6 +36,8 @@ public class ActiveRagdoll2D : MonoBehaviour
     [Header("Auto-Wire References")]
     public Transform physicsRigRoot;
     public Transform animRigRoot;
+    [Tooltip("Limb names to skip during auto-wire (e.g. legs managed by ProceduralLegs2D).")]
+    public string[] excludeNames;
 
     TargetJoint2D _hipTargetJoint;
 
@@ -118,6 +120,13 @@ public class ActiveRagdoll2D : MonoBehaviour
         foreach (HingeJoint2D hinge in hinges)
         {
             string limbName = hinge.gameObject.name;
+
+            if (IsExcluded(limbName))
+            {
+                Debug.Log($"ActiveRagdoll2D: Skipping excluded limb '{limbName}'");
+                continue;
+            }
+
             Transform match = null;
 
             foreach (Transform t in animTransforms)
@@ -154,5 +163,16 @@ public class ActiveRagdoll2D : MonoBehaviour
 #if UNITY_EDITOR
         UnityEditor.EditorUtility.SetDirty(this);
 #endif
+    }
+
+    bool IsExcluded(string limbName)
+    {
+        if (excludeNames == null) return false;
+        for (int i = 0; i < excludeNames.Length; i++)
+        {
+            if (!string.IsNullOrEmpty(excludeNames[i]) && limbName.Contains(excludeNames[i]))
+                return true;
+        }
+        return false;
     }
 }
